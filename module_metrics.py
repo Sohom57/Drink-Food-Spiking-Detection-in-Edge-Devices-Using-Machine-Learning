@@ -1,103 +1,187 @@
-import time
-import platform
-import psutil
-import cv2
 import csv
 import os
+import platform
 import subprocess
+import time
 from datetime import datetime
 
-class PerformanceEvaluator:
-    def __init__(self, log_dir="logs", ai_model_names="YOLOv8n + InsightFace Buffalo_L + MediaPipe"):
-        """Initializes the evaluator, prints specs, and sets up data logging."""
-        self.log_dir = log_dir
-        self.ai_model_names = ai_model_names
-        
-        # Create a folder for logs if it doesn't exist
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
-            
-        self.print_system_metrics()
-        self.setup_logging()
+import cv2
+import psutil
 
-    def get_pc_model(self):
-        """Attempts to fetch the physical hardware model of the PC."""
+try:
+    import GPUtil
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
+
+
+class PerformanceEvaluator:
+    def __init__(self, log_dir="data-logs", spec_file="hardware_specs.txt", log_file="hardware_logs.csv", tamper_file="tamper_events.csv"):
+        self.log_dir = log_dir
+        self.spec_path = os.path.join(log_dir, spec_file)
+        self.log_path = os.path.join(log_dir, log_file)
+        self.tamper_path = os.path.join(log_dir, tamper_file)
+
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        self.fps_list = []
+        self.fps = 0.0
+        self.max_ram_used_gb = 0.0
+        self.gpu_name = "N/A"
+        self.max_gpu_load = 0.0
+        self.max_gpu_mem = 0.0
+
+        self._setup_tamper_csv()
+        self._generate_specs_file()
+
+    def _get_processor_name(self):
         try:
             if platform.system() == "Windows":
-                # Uses Windows Management Instrumentation to get the PC model
-                output = subprocess.check_output("wmic csproduct get name", shell=True)
-                return output.decode().split('\n')[1].strip()
+                return platform.processor()
             elif platform.system() == "Darwin":
-                # Uses sysctl on macOS
-                output = subprocess.check_output("sysctl -n hw.model", shell=True)
-                return output.decode().strip()
-            else:
-                return platform.machine()
+                command = "sysctl -n machdep.cpu.brand_string"
+                return subprocess.check_output(command, shell=True).decode().strip()
+            elif platform.system() == "Linux":
+                command = "cat /proc/cpuinfo | grep 'model name' | uniq"
+                return subprocess.check_output(command, shell=True).decode().split(':')[1].strip()
         except Exception:
-            return "Unknown / Custom Build"
+            return platform.machine()
+        return "Unknown Processor"
 
-    def print_system_metrics(self):
-        """Fetches PC specifications, prints them, and saves to a text file."""
-        pc_model = self.get_pc_model()
-        
-        specs = (
-            f"{'='*55}\n"
-            f" EDGE-AI HARDWARE & MODEL EVALUATION MATRIX\n"
-            f"{'='*55}\n"
-            f"AI Pipeline   : {self.ai_model_names}\n"
-            f"{'-'*55}\n"
-            f"Device Model  : {pc_model}\n"
-            f"OS Platform   : {platform.system()} {platform.release()}\n"
-            f"Processor     : {platform.processor()}\n"
-            f"CPU Cores     : {psutil.cpu_count(logical=False)} Physical / {psutil.cpu_count(logical=True)} Logical\n"
-            f"Total Memory  : {round(psutil.virtual_memory().total / (1024.**3), 2)} GB\n"
-            f"{'='*55}\n"
-        )
-        print("\n" + specs)
-        
-        # Save static hardware and AI specs to a text file
-        specs_path = os.path.join(self.log_dir, "hardware_specs.txt")
-        with open(specs_path, "w") as f:
-            f.write(specs)
+    def _get_device_model(self):
+        try:
+            if platform.system() == "Windows":
+                cmd = "wmic csproduct get name"
+                output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode(errors="ignore")
+                lines = [line.strip() for line in output.split('\n') if line.strip()]
+                if len(lines) > 1:
+                    return lines[1]
+            elif platform.system() == "Linux":
+                if os.path.exists("/sys/class/dmi/id/product_name"):
+                    with open("/sys/class/dmi/id/product_name", "r") as f:
+                        return f.read().strip()
+            elif platform.system() == "Darwin":
+                cmd = "sysctl -n hw.model"
+                return subprocess.check_output(cmd, shell=True).decode().strip()
+        except Exception:
+            pass
+        return "Unknown Model"
 
-    def setup_logging(self):
-        """Initializes the CSV file for real-time performance tracking."""
-        session_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_path = os.path.join(self.log_dir, f"metrics_log_{session_time}.csv")
-        
-        # Create file and write the column headers (Now including the AI Pipeline)
-        with open(self.csv_path, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([
-                "Timestamp", 
-                "AI_Models", 
-                "Processing_Time_Sec", 
-                "FPS", 
-                "CPU_Usage_Percent", 
-                "RAM_Usage_Percent"
-            ])
+    def _generate_specs_file(self):
+        device_name = platform.node()
+        device_model = self._get_device_model()
+        os_platform = f"{platform.system()} {platform.release()}"
+        processor = self._get_processor_name()
+        cpu_cores = psutil.cpu_count(logical=True)
+        total_memory_gb = round(psutil.virtual_memory().total / (1024 ** 3), 2)
+
+        gpu_format = "N/A"
+        if GPU_AVAILABLE:
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu_format = gpus[0].name
+                    self.gpu_name = gpu_format
+            except Exception:
+                pass
+
+        with open(self.spec_path, "w", encoding="utf-8") as f:
+            f.write(f"Device Name: {device_name}\n")
+            f.write(f"Device Model: {device_model}\n")
+            f.write(f"Os Platform: {os_platform}\n")
+            f.write(f"Processor: {processor}\n")
+            f.write(f"CPU with Cores: {processor} ({cpu_cores} cores)\n")
+            f.write(f"Total Memory: {total_memory_gb} GB\n")
+            f.write(f"GPU: {gpu_format}\n")
+            f.write(f"Total RAM: {total_memory_gb} GB\n")
+            f.write(f"CPU: {processor}\n")
+
+    def _setup_tamper_csv(self):
+        if not os.path.isfile(self.tamper_path):
+            with open(self.tamper_path, mode="w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Tamper Timestamp", "Target Object Category", "Tampered or not"])
 
     def update_and_draw(self, img, loop_start_time):
-        """Calculates, draws, and logs real-time edge-CPU performance metrics."""
-        process_time = time.time() - loop_start_time
-        fps = 1.0 / process_time if process_time > 0 else 0
-        
-        # Gather live hardware metrics
-        cpu_usage = psutil.cpu_percent()
-        ram_usage = psutil.virtual_memory().percent
-        
-        # 1. Draw on the camera HUD
-        cv2.putText(img, f"FPS: {int(fps)} | CPU: {cpu_usage}%", (15, 35), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        current_time = time.time()
+        time_diff = current_time - loop_start_time
 
-        # 2. Log data safely to the CSV file
-        with open(self.csv_path, mode='a', newline='') as file:
+        if time_diff > 0:
+            current_fps = 1.0 / time_diff
+            self.fps = (self.fps * 0.9) + (current_fps * 0.1)
+
+        self.fps_list.append(self.fps)
+
+        ram_used_gb = round(psutil.virtual_memory().used / (1024 ** 3), 2)
+        if ram_used_gb > self.max_ram_used_gb:
+            self.max_ram_used_gb = ram_used_gb
+
+        if GPU_AVAILABLE:
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]
+                    self.gpu_name = gpu.name
+                    if gpu.load * 100 > self.max_gpu_load:
+                        self.max_gpu_load = round(gpu.load * 100, 1)
+                    if gpu.memoryUsed > self.max_gpu_mem:
+                        self.max_gpu_mem = gpu.memoryUsed
+            except Exception:
+                pass
+
+        cv2.putText(
+            img,
+            f"FPS: {int(self.fps)}",
+            (img.shape[1] - 150, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        return img
+
+    def log_tamper_event(self, category, tampered_status="YES"):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.tamper_path, mode="a", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
+            writer.writerow([timestamp, category, tampered_status])
+
+    def finalize_test_log(self, tampered_status):
+        if self.fps_list:
+            avg_fps = round(sum(self.fps_list) / len(self.fps_list), 1)
+            best_fps = round(max(self.fps_list), 1)
+            lowest_fps = round(min(self.fps_list), 1)
+        else:
+            avg_fps, best_fps, lowest_fps = 0.0, 0.0, 0.0
+
+        tampered_str = "YES" if tampered_status else "NO"
+
+        file_exists = os.path.isfile(self.log_path)
+        with open(self.log_path, mode="a", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow([
+                    "Average FPS",
+                    "Best FPS",
+                    "Lowest FPS",
+                    "Tampered or not",
+                    "Ram used (GB)",
+                    "GPU_Name",
+                    "GPU Load (%)",
+                    "GPU memory used (MB)",
+                ])
+
             writer.writerow([
-                datetime.now().strftime("%H:%M:%S.%f")[:-3], # Current time with milliseconds
-                self.ai_model_names,                         # The AI Models being evaluated
-                round(process_time, 4),                      # Time taken to process the frame
-                round(fps, 2),                               # Frames per second
-                cpu_usage,                                   # CPU load
-                ram_usage                                    # RAM load
+                avg_fps,
+                best_fps,
+                lowest_fps,
+                tampered_str,
+                f"{self.max_ram_used_gb} GB",
+                self.gpu_name,
+                f"{self.max_gpu_load}%",
+                f"{self.max_gpu_mem} MB",
             ])
+
+    def close(self):
+        pass
